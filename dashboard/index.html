@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>PayWatch</title>
+<style>
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    margin: 0;
+    padding: 24px;
+    background: #0f1115;
+    color: #e6e8eb;
+    font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  }
+
+  h1 {
+    margin: 0 0 16px;
+    font-size: 20px;
+  }
+
+  #alert-banner {
+    background: #4a1414;
+    border: 1px solid #e05252;
+    border-radius: 8px;
+    padding: 12px 16px;
+    margin-bottom: 20px;
+  }
+
+  #alert-banner .alert-line {
+    padding: 4px 0;
+    font-size: 14px;
+  }
+
+  #merchant-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+    gap: 16px;
+  }
+
+  .card {
+    background: #1a1d24;
+    border: 1px solid #2a2e37;
+    border-radius: 10px;
+    padding: 16px;
+    position: relative;
+  }
+
+  .card h2 {
+    margin: 0 0 12px;
+    font-size: 16px;
+  }
+
+  .metric {
+    font-size: 13px;
+    color: #9aa1ab;
+    margin: 4px 0;
+  }
+
+  .success-rate {
+    font-size: 22px;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .success-rate.green { color: #3ecf6b; }
+  .success-rate.yellow { color: #e0c341; }
+  .success-rate.red { color: #e05252; }
+
+  .badge {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    background: #e05252;
+    color: #fff;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 3px 8px;
+    border-radius: 999px;
+  }
+</style>
+</head>
+<body>
+  <h1>PayWatch</h1>
+  <div id="alert-banner" style="display: none;"></div>
+  <div id="merchant-grid"></div>
+
+<script>
+  const POLL_INTERVAL_MS = 3000;
+  let merchants = [];
+
+  function successRateClass(rate) {
+    if (rate >= 0.95) return 'green';
+    if (rate >= 0.90) return 'yellow';
+    return 'red';
+  }
+
+  async function loadMerchants() {
+    const res = await fetch('/merchants');
+    merchants = await res.json();
+
+    const grid = document.getElementById('merchant-grid');
+    grid.innerHTML = merchants.map(m => `
+      <div class="card" id="card-${m.id}">
+        <span class="badge" id="badge-${m.id}" style="display: none;">ALERT</span>
+        <h2>${m.name}</h2>
+        <div class="success-rate" id="success-rate-${m.id}">--</div>
+        <div class="metric">Avg latency: <span id="latency-${m.id}">--</span> ms</div>
+        <div class="metric">Avg fraud score: <span id="fraud-${m.id}">--</span></div>
+      </div>
+    `).join('');
+  }
+
+  async function fetchStats(merchant) {
+    const res = await fetch(`/merchants/${merchant.id}/stats`);
+    if (!res.ok) return null;
+    return res.json();
+  }
+
+  async function fetchActiveAlerts(merchant) {
+    const res = await fetch(`/merchants/${merchant.id}/alerts/active`);
+    if (!res.ok) return [];
+    return res.json();
+  }
+
+  function updateCard(merchant, stats) {
+    const rateEl = document.getElementById(`success-rate-${merchant.id}`);
+    const latencyEl = document.getElementById(`latency-${merchant.id}`);
+    const fraudEl = document.getElementById(`fraud-${merchant.id}`);
+
+    if (!stats) {
+      rateEl.textContent = 'No data yet';
+      rateEl.className = 'success-rate';
+      latencyEl.textContent = '--';
+      fraudEl.textContent = '--';
+      return;
+    }
+
+    rateEl.textContent = `${(stats.success_rate * 100).toFixed(1)}%`;
+    rateEl.className = `success-rate ${successRateClass(stats.success_rate)}`;
+    latencyEl.textContent = stats.avg_latency_ms.toFixed(0);
+    fraudEl.textContent = stats.avg_fraud_score.toFixed(3);
+  }
+
+  function updateBadge(merchant, alerts) {
+    const badge = document.getElementById(`badge-${merchant.id}`);
+    badge.style.display = alerts.length > 0 ? 'block' : 'none';
+  }
+
+  function renderBanner(allAlerts) {
+    const banner = document.getElementById('alert-banner');
+
+    if (allAlerts.length === 0) {
+      banner.style.display = 'none';
+      banner.innerHTML = '';
+      return;
+    }
+
+    banner.style.display = 'block';
+    banner.innerHTML = allAlerts
+      .map(a => `<div class="alert-line">${a.description}</div>`)
+      .join('');
+  }
+
+  async function refresh() {
+    if (merchants.length === 0) return;
+
+    const [statsResults, alertsResults] = await Promise.all([
+      Promise.all(merchants.map(fetchStats)),
+      Promise.all(merchants.map(fetchActiveAlerts)),
+    ]);
+
+    const allActiveAlerts = [];
+    merchants.forEach((merchant, i) => {
+      updateCard(merchant, statsResults[i]);
+      updateBadge(merchant, alertsResults[i]);
+      allActiveAlerts.push(...alertsResults[i]);
+    });
+    renderBanner(allActiveAlerts);
+  }
+
+  async function init() {
+    await loadMerchants();
+    await refresh();
+    setInterval(refresh, POLL_INTERVAL_MS);
+  }
+
+  init();
+</script>
+</body>
+</html>

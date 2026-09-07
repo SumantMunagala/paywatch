@@ -11,6 +11,7 @@ import redis
 from elasticsearch import Elasticsearch
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 
 from shared.config import ELASTICSEARCH_URL, POSTGRES_URL, REDIS_URL
 from shared.models import AlertRecord
@@ -21,9 +22,7 @@ NUMERIC_STATS_FIELDS = {
     "transaction_count": int,
     "success_count": int,
     "success_rate": float,
-    "total_latency_ms": float,
     "avg_latency_ms": float,
-    "total_fraud_score": float,
     "avg_fraud_score": float,
     "volume_per_min": int,
 }
@@ -134,3 +133,7 @@ def get_alert_history(merchant_id: str):
             (merchant_id,),
         )
         return cur.fetchall()
+
+
+DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
+app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard")

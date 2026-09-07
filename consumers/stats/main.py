@@ -4,38 +4,64 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
+import psycopg2
 import redis
 from confluent_kafka import Consumer
 
-from shared.config import REDIS_URL, get_kafka_config
-from shared.models import TransactionEvent
+from consumers.stats.detector import AnomalyDetector, ResolveSignal
+from shared.config import POSTGRES_URL, REDIS_URL, get_kafka_config
+from shared.models import AlertRecord, TransactionEvent
 
 TOPIC = "transactions"
 GROUP_ID = "stats-group"
 VOLUME_WINDOW_SECONDS = 60
+METRICS = ["success_rate", "avg_latency_ms", "avg_fraud_score", "volume_per_min"]
+
+# Smoothing factor for the EWMA below. Half-life is ln(0.5)/ln(1-alpha).
+# avg_latency_ms/avg_fraud_score are continuous values with gentle
+# per-transaction jitter, so EWMA_ALPHA=0.1 (~6.6-observation half-life)
+# reacts within single-digit seconds without much noise. success_rate is a
+# raw 0/1 outcome per transaction -- at that alpha, a statistically normal
+# short run of failures swings the EWMA by 10+ points, easily crossing even
+# a correctly-learned 3-sigma threshold. EWMA_ALPHA_SUCCESS_RATE=0.03
+# (~23-observation half-life) still reacts within tens of seconds but
+# smooths out that per-transaction binary noise.
+EWMA_ALPHA = 0.1
+EWMA_ALPHA_SUCCESS_RATE = 0.03
 
 
 def update_stats(r: redis.Redis, event: TransactionEvent) -> dict:
     stats_key = f"stats:{event.merchant_id}"
     volume_key = f"stats:{event.merchant_id}:volume"
 
-    pipe = r.pipeline()
-    pipe.hincrby(stats_key, "transaction_count", 1)
-    pipe.hincrby(stats_key, "success_count", 1 if event.status == "success" else 0)
-    pipe.hincrbyfloat(stats_key, "total_latency_ms", event.processor_latency_ms)
-    pipe.hincrbyfloat(stats_key, "total_fraud_score", event.fraud_score)
-    transaction_count, success_count, total_latency_ms, total_fraud_score = pipe.execute()
+    previous = r.hgetall(stats_key)
+    is_success = 1.0 if event.status == "success" else 0.0
 
-    success_rate = success_count / transaction_count
-    avg_latency_ms = total_latency_ms / transaction_count
-    avg_fraud_score = total_fraud_score / transaction_count
+    if previous:
+        success_rate = EWMA_ALPHA_SUCCESS_RATE * is_success + (
+            1 - EWMA_ALPHA_SUCCESS_RATE
+        ) * float(previous["success_rate"])
+        avg_latency_ms = EWMA_ALPHA * event.processor_latency_ms + (1 - EWMA_ALPHA) * float(
+            previous["avg_latency_ms"]
+        )
+        avg_fraud_score = EWMA_ALPHA * event.fraud_score + (1 - EWMA_ALPHA) * float(
+            previous["avg_fraud_score"]
+        )
+    else:
+        # First transaction ever seen for this merchant: no prior EWMA to
+        # blend with, so bootstrap directly from this observation.
+        success_rate = is_success
+        avg_latency_ms = float(event.processor_latency_ms)
+        avg_fraud_score = event.fraud_score
 
     now = time.time()
     pipe = r.pipeline()
+    pipe.hincrby(stats_key, "transaction_count", 1)
+    pipe.hincrby(stats_key, "success_count", 1 if event.status == "success" else 0)
     pipe.zadd(volume_key, {event.transaction_id: now})
     pipe.zremrangebyscore(volume_key, 0, now - VOLUME_WINDOW_SECONDS)
     pipe.zcard(volume_key)
-    _, _, volume_per_min = pipe.execute()
+    transaction_count, success_count, _, _, volume_per_min = pipe.execute()
 
     r.hset(
         stats_key,
@@ -57,8 +83,76 @@ def update_stats(r: redis.Redis, event: TransactionEvent) -> dict:
     }
 
 
+def record_alert_fired(r: redis.Redis, pg_conn, alert: AlertRecord) -> None:
+    r.hset(
+        f"alert:{alert.merchant_id}:{alert.metric}",
+        mapping={
+            "status": "FIRING",
+            "description": alert.description,
+            "fired_at": alert.fired_at.isoformat(),
+            "z_score": alert.z_score,
+        },
+    )
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO alerts
+                (id, merchant_id, metric, current_value, baseline_value, z_score, description, fired_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                alert.alert_id,
+                alert.merchant_id,
+                alert.metric,
+                alert.current_value,
+                alert.baseline_value,
+                alert.z_score,
+                alert.description,
+                alert.fired_at,
+            ),
+        )
+
+    print(f"ALERT FIRED: {alert.description}", flush=True)
+
+
+def record_alert_resolved(r: redis.Redis, pg_conn, resolve: ResolveSignal) -> None:
+    r.hset(f"alert:{resolve.merchant_id}:{resolve.metric}", "status", "RESOLVED")
+
+    with pg_conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE alerts
+            SET resolved_at = now()
+            WHERE merchant_id = %s AND metric = %s AND resolved_at IS NULL
+            """,
+            (resolve.merchant_id, resolve.metric),
+        )
+
+    print(f"ALERT RESOLVED: {resolve.merchant_id} {resolve.metric}", flush=True)
+
+
+def check_anomalies(
+    detector: AnomalyDetector,
+    r: redis.Redis,
+    pg_conn,
+    event: TransactionEvent,
+    stats: dict,
+) -> None:
+    for metric in METRICS:
+        result = detector.update(event.merchant_id, event.merchant_name, metric, stats[metric])
+
+        if isinstance(result, AlertRecord):
+            record_alert_fired(r, pg_conn, result)
+        elif isinstance(result, ResolveSignal):
+            record_alert_resolved(r, pg_conn, result)
+
+
 def main() -> None:
     r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    pg_conn = psycopg2.connect(POSTGRES_URL)
+    pg_conn.autocommit = True
+    detector = AnomalyDetector(r)
 
     kafka_config = get_kafka_config()
     kafka_config.update(
@@ -88,6 +182,7 @@ def main() -> None:
 
             event = TransactionEvent.model_validate_json(msg.value())
             stats = update_stats(r, event)
+            check_anomalies(detector, r, pg_conn, event, stats)
 
             print(
                 f"[{event.merchant_name}] "
@@ -104,6 +199,7 @@ def main() -> None:
         print("\nShutting down...")
     finally:
         consumer.close()
+        pg_conn.close()
 
 
 if __name__ == "__main__":
