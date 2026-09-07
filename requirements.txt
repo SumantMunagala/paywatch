@@ -1,0 +1,7 @@
+psycopg2-binary
+python-dotenv
+confluent-kafka
+elasticsearch>=8.0.0,<9.0.0
+redis
+fastapi
+uvicorn[standard]

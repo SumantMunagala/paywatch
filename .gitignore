@@ -1,0 +1,15 @@
+.env
+__pycache__/
+*.pyc
+venv/
+*.log
+
+# Personal/interview-prep docs and local tool config -- not meant for
+# a public GitHub audience, just this local working session
+CLAUDE.md
+interview-guide.md
+.claude/
+
+# Common editor/IDE local config
+.vscode/
+.idea/
