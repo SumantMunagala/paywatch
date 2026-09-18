@@ -1,5 +1,8 @@
+import os
 import sys
 import time
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
@@ -17,7 +20,23 @@ TOPIC = "transactions"
 GROUP_ID = "stats-group"
 VOLUME_WINDOW_SECONDS = 60
 METRICS = ["success_rate", "avg_latency_ms", "avg_fraud_score", "volume_per_min"]
-METRICS_PORT = 8002
+# Logging-only label to tell instances apart in a multi-instance run -- has
+# no effect on Kafka partition assignment, which is entirely up to the
+# broker's consumer group rebalance protocol.
+CONSUMER_INSTANCE_ID = os.getenv("CONSUMER_INSTANCE_ID", "stats-1")
+# Every instance in this consumer group runs on the same machine during
+# local multi-instance testing, so a fixed port would only let the first
+# instance bind it -- METRICS_PORT must be set uniquely per instance (e.g.
+# 8002, 8003, 8004...) whenever running more than one at once.
+METRICS_PORT = int(os.getenv("METRICS_PORT", "8002"))
+
+STATS_BATCH_SIZE = 50
+STATS_BATCH_TIMEOUT_SECONDS = 1.0
+# Same reasoning as the indexer's batch rewrite: a short poll timeout lets
+# the loop notice STATS_BATCH_TIMEOUT_SECONDS elapsing promptly even when
+# messages are arriving slowly or not at all, instead of blocking for up to
+# a full second inside a single poll() call.
+POLL_TIMEOUT_SECONDS = 0.1
 
 transactions_processed_total = Counter(
     "transactions_processed_total", "Total transactions processed", ["merchant_id"]
@@ -40,57 +59,91 @@ EWMA_ALPHA = 0.1
 EWMA_ALPHA_SUCCESS_RATE = 0.03
 
 
-def update_stats(r: redis.Redis, event: TransactionEvent) -> dict:
-    stats_key = f"stats:{event.merchant_id}"
-    volume_key = f"stats:{event.merchant_id}:volume"
+@dataclass
+class MerchantStats:
+    merchant_name: str
+    transaction_count: int = 0
+    success_count: int = 0
+    success_rate: float = 0.0
+    avg_latency_ms: float = 0.0
+    avg_fraud_score: float = 0.0
+    # Wall-clock timestamps of recent events, oldest first -- an in-memory
+    # equivalent of the old stats:{id}:volume sorted set. len() after
+    # trimming anything older than VOLUME_WINDOW_SECONDS is volume_per_min.
+    volume_timestamps: deque = field(default_factory=deque)
 
-    previous = r.hgetall(stats_key)
-    is_success = 1.0 if event.status == "success" else 0.0
 
+def get_or_seed_stats(
+    r: redis.Redis,
+    merchant_id: str,
+    merchant_name: str,
+    merchant_stats: dict[str, MerchantStats],
+) -> MerchantStats:
+    if merchant_id in merchant_stats:
+        return merchant_stats[merchant_id]
+
+    # First time this process has seen this merchant -- load its
+    # last-persisted state once so a restart doesn't reset a merchant's
+    # learned EWMA baselines back to zero (the same lazy-load-once,
+    # write-through-on-flush pattern AnomalyDetector already uses for
+    # WelfordState).
+    previous = r.hgetall(f"stats:{merchant_id}")
     if previous:
-        success_rate = EWMA_ALPHA_SUCCESS_RATE * is_success + (
-            1 - EWMA_ALPHA_SUCCESS_RATE
-        ) * float(previous["success_rate"])
-        avg_latency_ms = EWMA_ALPHA * event.processor_latency_ms + (1 - EWMA_ALPHA) * float(
-            previous["avg_latency_ms"]
-        )
-        avg_fraud_score = EWMA_ALPHA * event.fraud_score + (1 - EWMA_ALPHA) * float(
-            previous["avg_fraud_score"]
+        stats = MerchantStats(
+            merchant_name=merchant_name,
+            transaction_count=int(previous.get("transaction_count", 0)),
+            success_count=int(previous.get("success_count", 0)),
+            success_rate=float(previous.get("success_rate", 0.0)),
+            avg_latency_ms=float(previous.get("avg_latency_ms", 0.0)),
+            avg_fraud_score=float(previous.get("avg_fraud_score", 0.0)),
         )
     else:
-        # First transaction ever seen for this merchant: no prior EWMA to
-        # blend with, so bootstrap directly from this observation.
-        success_rate = is_success
-        avg_latency_ms = float(event.processor_latency_ms)
-        avg_fraud_score = event.fraud_score
+        stats = MerchantStats(merchant_name=merchant_name)
+
+    # Seed the volume window from the old sorted set's scores (timestamps),
+    # if any survive within the window -- keeps volume_per_min from
+    # momentarily reading 0 for an already-active merchant right after a
+    # restart.
+    now = time.time()
+    existing = r.zrangebyscore(
+        f"stats:{merchant_id}:volume", now - VOLUME_WINDOW_SECONDS, now, withscores=True
+    )
+    stats.volume_timestamps.extend(sorted(score for _member, score in existing))
+
+    merchant_stats[merchant_id] = stats
+    return stats
+
+
+def apply_event_in_memory(stats: MerchantStats, event: TransactionEvent) -> None:
+    is_success = 1.0 if event.status == "success" else 0.0
+
+    if stats.transaction_count == 0:
+        # First transaction ever seen for this merchant (no prior Redis
+        # state either): no prior EWMA to blend with, so bootstrap directly
+        # from this observation.
+        stats.success_rate = is_success
+        stats.avg_latency_ms = float(event.processor_latency_ms)
+        stats.avg_fraud_score = event.fraud_score
+    else:
+        stats.success_rate = (
+            EWMA_ALPHA_SUCCESS_RATE * is_success
+            + (1 - EWMA_ALPHA_SUCCESS_RATE) * stats.success_rate
+        )
+        stats.avg_latency_ms = (
+            EWMA_ALPHA * event.processor_latency_ms + (1 - EWMA_ALPHA) * stats.avg_latency_ms
+        )
+        stats.avg_fraud_score = (
+            EWMA_ALPHA * event.fraud_score + (1 - EWMA_ALPHA) * stats.avg_fraud_score
+        )
+
+    stats.transaction_count += 1
+    stats.success_count += 1 if event.status == "success" else 0
 
     now = time.time()
-    pipe = r.pipeline()
-    pipe.hincrby(stats_key, "transaction_count", 1)
-    pipe.hincrby(stats_key, "success_count", 1 if event.status == "success" else 0)
-    pipe.zadd(volume_key, {event.transaction_id: now})
-    pipe.zremrangebyscore(volume_key, 0, now - VOLUME_WINDOW_SECONDS)
-    pipe.zcard(volume_key)
-    transaction_count, success_count, _, _, volume_per_min = pipe.execute()
-
-    r.hset(
-        stats_key,
-        mapping={
-            "success_rate": success_rate,
-            "avg_latency_ms": avg_latency_ms,
-            "avg_fraud_score": avg_fraud_score,
-            "volume_per_min": volume_per_min,
-        },
-    )
-
-    return {
-        "transaction_count": transaction_count,
-        "success_count": success_count,
-        "success_rate": success_rate,
-        "avg_latency_ms": avg_latency_ms,
-        "avg_fraud_score": avg_fraud_score,
-        "volume_per_min": volume_per_min,
-    }
+    stats.volume_timestamps.append(now)
+    cutoff = now - VOLUME_WINDOW_SECONDS
+    while stats.volume_timestamps and stats.volume_timestamps[0] < cutoff:
+        stats.volume_timestamps.popleft()
 
 
 def record_alert_fired(r: redis.Redis, pg_conn, alert: AlertRecord) -> None:
@@ -144,20 +197,69 @@ def record_alert_resolved(r: redis.Redis, pg_conn, resolve: ResolveSignal) -> No
     print(f"ALERT RESOLVED: {resolve.merchant_id} {resolve.metric}", flush=True)
 
 
-def check_anomalies(
-    detector: AnomalyDetector,
+def flush_batch(
     r: redis.Redis,
     pg_conn,
-    event: TransactionEvent,
-    stats: dict,
+    detector: AnomalyDetector,
+    consumer: Consumer,
+    merchant_stats: dict[str, MerchantStats],
+    merchants_touched: set[str],
+    pending_alerts: list,
+    last_msg,
+    batch_size: int,
 ) -> None:
-    for metric in METRICS:
-        result = detector.update(event.merchant_id, event.merchant_name, metric, stats[metric])
+    pipe = r.pipeline()
 
-        if isinstance(result, AlertRecord):
-            record_alert_fired(r, pg_conn, result)
-        elif isinstance(result, ResolveSignal):
-            record_alert_resolved(r, pg_conn, result)
+    for merchant_id in merchants_touched:
+        stats = merchant_stats[merchant_id]
+        volume_per_min = len(stats.volume_timestamps)
+
+        pipe.hset(
+            f"stats:{merchant_id}",
+            mapping={
+                "transaction_count": stats.transaction_count,
+                "success_count": stats.success_count,
+                "success_rate": stats.success_rate,
+                "avg_latency_ms": stats.avg_latency_ms,
+                "avg_fraud_score": stats.avg_fraud_score,
+                "volume_per_min": volume_per_min,
+            },
+        )
+
+        # Rewrite the volume sorted set from the in-memory window rather
+        # than incrementally zadd-ing per message -- keeps Redis a valid,
+        # restart-safe snapshot of the window even though it's no longer
+        # touched per message. Members just need to be unique strings;
+        # nothing reads them individually (only the count/scores matter).
+        volume_key = f"stats:{merchant_id}:volume"
+        pipe.delete(volume_key)
+        if stats.volume_timestamps:
+            pipe.zadd(
+                volume_key,
+                {f"{ts}:{i}": ts for i, ts in enumerate(stats.volume_timestamps)},
+            )
+
+    # Same pipeline, same round trip: every WelfordState/alert_state key
+    # AnomalyDetector marked dirty since the last flush.
+    detector.flush_to_pipeline(pipe)
+
+    pipe.execute()
+
+    # Alert writes are rare and their latency doesn't affect throughput, so
+    # they stay synchronous and outside the pipeline above.
+    for item in pending_alerts:
+        if isinstance(item, AlertRecord):
+            record_alert_fired(r, pg_conn, item)
+        elif isinstance(item, ResolveSignal):
+            record_alert_resolved(r, pg_conn, item)
+
+    consumer.commit(message=last_msg, asynchronous=False)
+
+    print(
+        f"[{CONSUMER_INSTANCE_ID}] Stats batch flushed: {batch_size} messages, "
+        f"{len(merchants_touched)} merchants, {len(pending_alerts)} alerts fired",
+        flush=True,
+    )
 
 
 def main() -> None:
@@ -166,7 +268,7 @@ def main() -> None:
     r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     pg_conn = psycopg2.connect(POSTGRES_URL)
     pg_conn.autocommit = True
-    detector = AnomalyDetector(r)
+    detector = AnomalyDetector(r, defer_redis=True)
 
     kafka_config = get_kafka_config()
     kafka_config.update(
@@ -180,43 +282,90 @@ def main() -> None:
     consumer.subscribe([TOPIC])
 
     print(
-        f"Stats consumer started (group '{GROUP_ID}'), subscribed to '{TOPIC}'...",
+        f"[{CONSUMER_INSTANCE_ID}] Stats consumer started (group '{GROUP_ID}'), "
+        f"subscribed to '{TOPIC}', batching up to {STATS_BATCH_SIZE} messages or every "
+        f"{STATS_BATCH_TIMEOUT_SECONDS}s, metrics on :{METRICS_PORT}...",
         flush=True,
     )
 
+    merchant_stats: dict[str, MerchantStats] = {}
+    batch_size = 0
+    merchants_touched: set[str] = set()
+    pending_alerts: list = []
+    last_msg = None
+    last_flush_time = time.time()
+
     try:
         while True:
-            msg = consumer.poll(1.0)
+            msg = consumer.poll(POLL_TIMEOUT_SECONDS)
 
-            if msg is None:
-                continue
-            if msg.error():
-                print(f"Consumer error: {msg.error()}", flush=True)
-                continue
+            if msg is not None:
+                if msg.error():
+                    print(f"Consumer error: {msg.error()}", flush=True)
+                else:
+                    event = TransactionEvent.model_validate_json(msg.value())
 
-            event = TransactionEvent.model_validate_json(msg.value())
-            stats = update_stats(r, event)
-            check_anomalies(detector, r, pg_conn, event, stats)
+                    stats = get_or_seed_stats(
+                        r, event.merchant_id, event.merchant_name, merchant_stats
+                    )
+                    apply_event_in_memory(stats, event)
 
-            transactions_processed_total.labels(merchant_id=event.merchant_id).inc()
+                    current_values = {
+                        "success_rate": stats.success_rate,
+                        "avg_latency_ms": stats.avg_latency_ms,
+                        "avg_fraud_score": stats.avg_fraud_score,
+                        "volume_per_min": len(stats.volume_timestamps),
+                    }
+                    for metric in METRICS:
+                        result = detector.update(
+                            event.merchant_id, event.merchant_name, metric, current_values[metric]
+                        )
+                        if isinstance(result, (AlertRecord, ResolveSignal)):
+                            pending_alerts.append(result)
 
-            timestamp_type, timestamp_ms = msg.timestamp()
-            if timestamp_type != 0:  # TIMESTAMP_NOT_AVAILABLE
-                consumer_lag_seconds.set(time.time() - timestamp_ms / 1000.0)
+                    transactions_processed_total.labels(merchant_id=event.merchant_id).inc()
 
-            print(
-                f"[{event.merchant_name}] "
-                f"count={stats['transaction_count']} "
-                f"success_rate={stats['success_rate']:.2%} "
-                f"avg_latency_ms={stats['avg_latency_ms']:.1f} "
-                f"avg_fraud_score={stats['avg_fraud_score']:.3f} "
-                f"volume_per_min={stats['volume_per_min']}",
-                flush=True,
-            )
+                    timestamp_type, timestamp_ms = msg.timestamp()
+                    if timestamp_type != 0:  # TIMESTAMP_NOT_AVAILABLE
+                        consumer_lag_seconds.set(time.time() - timestamp_ms / 1000.0)
 
-            consumer.commit(message=msg, asynchronous=False)
+                    merchants_touched.add(event.merchant_id)
+                    batch_size += 1
+                    last_msg = msg
+
+            size_reached = batch_size >= STATS_BATCH_SIZE
+            timed_out = (time.time() - last_flush_time) >= STATS_BATCH_TIMEOUT_SECONDS
+
+            if batch_size > 0 and (size_reached or timed_out):
+                flush_batch(
+                    r,
+                    pg_conn,
+                    detector,
+                    consumer,
+                    merchant_stats,
+                    merchants_touched,
+                    pending_alerts,
+                    last_msg,
+                    batch_size,
+                )
+                batch_size = 0
+                merchants_touched = set()
+                pending_alerts = []
+                last_flush_time = time.time()
     except KeyboardInterrupt:
         print("\nShutting down...")
+        if batch_size > 0:
+            flush_batch(
+                r,
+                pg_conn,
+                detector,
+                consumer,
+                merchant_stats,
+                merchants_touched,
+                pending_alerts,
+                last_msg,
+                batch_size,
+            )
     finally:
         consumer.close()
         pg_conn.close()

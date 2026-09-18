@@ -16,41 +16,58 @@ from shared.config import POSTGRES_URL, get_kafka_config
 from shared.models import TransactionEvent
 
 TOPIC = "transactions"
-TOPIC_PARTITIONS = 3
-
-MERCHANT_BASELINES = {
-    "Acme Store": {"success_rate": 0.96, "latency_ms": 180, "fraud_score": 0.08},
-    "Bravo Retail": {"success_rate": 0.94, "latency_ms": 220, "fraud_score": 0.11},
-    "Cypress Fashion": {"success_rate": 0.97, "latency_ms": 150, "fraud_score": 0.07},
-    "Delta Electronics": {"success_rate": 0.93, "latency_ms": 260, "fraud_score": 0.13},
-    "Echo Marketplace": {"success_rate": 0.95, "latency_ms": 200, "fraud_score": 0.09},
-}
+# Matches the live topic's current partition count (raised from 3 to 10 via
+# scripts/set_partitions.py) -- only takes effect if the topic doesn't
+# already exist, but keeping it in sync avoids silently recreating a
+# 3-partition topic in a fresh environment.
+TOPIC_PARTITIONS = 10
 
 PAYMENT_METHODS = ["card", "wallet", "bank_transfer"]
 PAYMENT_METHOD_WEIGHTS = [0.7, 0.2, 0.1]
 
 
 def load_merchants() -> list[dict]:
+    # Baselines now live in Postgres (scripts/seed_merchants.py), not a
+    # hardcoded dict here -- this is what lets the producer generate
+    # realistic traffic for every merchant the database happens to have,
+    # not just 5 known-by-name ones.
     conn = psycopg2.connect(POSTGRES_URL)
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT id, name FROM merchants")
+            cur.execute(
+                """
+                SELECT id, name, baseline_success_rate, baseline_avg_latency_ms,
+                       baseline_avg_fraud_score
+                FROM merchants
+                ORDER BY name
+                """
+            )
             rows = cur.fetchall()
     finally:
         conn.close()
 
-    ids_by_name = {name: str(merchant_id) for merchant_id, name in rows}
-
-    missing = [name for name in MERCHANT_BASELINES if name not in ids_by_name]
-    if missing:
+    if not rows:
         raise RuntimeError(
-            f"Merchants missing from database: {missing}. "
-            "Run scripts/apply_schema.py first."
+            "No merchants found in the database. "
+            "Run scripts/apply_schema.py and scripts/seed_merchants.py first."
+        )
+
+    missing_baseline = [name for _id, name, sr, _lat, _fr in rows if sr is None]
+    if missing_baseline:
+        raise RuntimeError(
+            f"Merchants missing a baseline: {missing_baseline}. "
+            "Run scripts/seed_merchants.py to backfill baseline columns."
         )
 
     return [
-        {"id": ids_by_name[name], "name": name, **baseline}
-        for name, baseline in MERCHANT_BASELINES.items()
+        {
+            "id": str(merchant_id),
+            "name": name,
+            "success_rate": success_rate,
+            "latency_ms": avg_latency_ms,
+            "fraud_score": avg_fraud_score,
+        }
+        for merchant_id, name, success_rate, avg_latency_ms, avg_fraud_score in rows
     ]
 
 
@@ -125,28 +142,42 @@ def main() -> None:
     ensure_topic(kafka_config)
     producer = Producer(kafka_config)
 
+    # Printing every event's JSON is useful at the default interactive rate
+    # (1/sec/merchant), but at load-test rates the print+flush call becomes
+    # the bottleneck being measured instead of real Kafka/consumer
+    # throughput -- skip it whenever a non-default rate is requested.
+    verbose = args.rate == 1
+    interval = 1 / args.rate
+
     print(
-        f"Publishing to '{TOPIC}' for {len(merchants)} merchants "
-        f"at {args.rate}/sec/merchant (Ctrl+C to stop)..."
+        f"Publishing to '{TOPIC}' for {len(merchants)} merchants at "
+        f"{args.rate}/sec/merchant ({args.rate * len(merchants)}/sec total, "
+        "Ctrl+C to stop)..."
     )
 
     try:
         while True:
+            tick_start = time.time()
+
             for merchant in merchants:
-                for _ in range(args.rate):
-                    event = build_event(merchant)
+                event = build_event(merchant)
 
-                    producer.poll(0)
-                    producer.produce(
-                        TOPIC,
-                        key=event.merchant_id.encode("utf-8"),
-                        value=event.model_dump_json().encode("utf-8"),
-                        callback=delivery_report,
-                    )
+                producer.poll(0)
+                producer.produce(
+                    TOPIC,
+                    key=event.merchant_id.encode("utf-8"),
+                    value=event.model_dump_json().encode("utf-8"),
+                    callback=delivery_report,
+                )
 
+                if verbose:
                     print(event.model_dump_json(), flush=True)
 
-            time.sleep(1)
+            # One event per merchant per tick, ticks spaced `interval`
+            # seconds apart, gives each merchant exactly `rate` events/sec
+            # regardless of how long producing this tick's events took.
+            elapsed = time.time() - tick_start
+            time.sleep(max(0.0, interval - elapsed))
     except KeyboardInterrupt:
         print("\nShutting down, flushing pending messages...")
     finally:
