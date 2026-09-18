@@ -129,10 +129,19 @@ data "aws_iam_policy_document" "github_deploy_assume_role" {
       values   = ["sts.amazonaws.com"]
     }
 
+    # "sub" uses GitHub's immutable subject-claim format
+    # (repo:<owner>@<owner_id>/<repo>@<repo_id>:ref:...), not the classic
+    # repo:<owner>/<repo>:ref:... format AWS's own docs still show as the
+    # default example. Repos created after 2026-07-15 (this one included)
+    # get the immutable format by default - found live via a real
+    # AccessDenied in CloudTrail showing the actual token's sub claim,
+    # confirmed against GitHub's current OIDC docs rather than assumed.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = ["repo:${var.github_repo}:ref:refs/heads/main"]
+      values = [
+        "repo:${split("/", var.github_repo)[0]}@${var.github_owner_id}/${split("/", var.github_repo)[1]}@${var.github_repo_id}:ref:refs/heads/main"
+      ]
     }
   }
 }

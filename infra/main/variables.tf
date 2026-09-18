@@ -26,3 +26,20 @@ variable "github_repo" {
   type        = string
   default     = "SumantMunagala/paywatch"
 }
+
+# GitHub's immutable OIDC subject-claim format (repos created after
+# 2026-07-15 default to it - confirmed live via CloudTrail's actual token
+# claims, then cross-checked against GitHub's current OIDC docs) embeds
+# these numeric, never-reassigned IDs alongside the owner/repo names in the
+# "sub" claim - see iam.tf's github_deploy_assume_role trust condition.
+variable "github_owner_id" {
+  description = "GitHub's numeric, immutable user ID for var.github_repo's owner"
+  type        = string
+  default     = "80919202"
+}
+
+variable "github_repo_id" {
+  description = "GitHub's numeric, immutable repository ID for var.github_repo"
+  type        = string
+  default     = "1333753566"
+}

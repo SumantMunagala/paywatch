@@ -46,7 +46,7 @@ jobs:
       # and :<short-sha> tags. One source of truth for this logic between
       # local dev and CI, not two copies that can drift.
       - name: Build and push all 4 images to ECR
-        run: ./scripts/push_images.sh
+        run: bash scripts/push_images.sh
 
       # Re-authenticates Docker to ECR on the EC2 side before pulling: the
       # instance's own ECR login (from first boot) is a token that expires
