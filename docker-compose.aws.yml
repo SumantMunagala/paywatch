@@ -8,6 +8,15 @@
 # advertises itself back as "localhost:9092", which would just be the
 # container talking to itself. See docker-compose.yml's own comment on the
 # same distinction for local dev's host-process case.
+#
+# Redpanda/Elasticsearch memory here is deliberately lower than
+# docker-compose.yml's local-dev values (1G/512m) - this file only runs on
+# the real EC2 instance (t3.small, 2GB total, and the only size this AWS
+# account's plan allows - confirmed live, both resizing and launching a
+# bigger instance were rejected). Adding Prometheus+Grafana pushed 8
+# containers' combined footprint over that ceiling and caused a real
+# outage (SSH itself became unresponsive). Local dev machines don't share
+# this constraint, so docker-compose.yml is untouched.
 
 networks:
   paywatch:
@@ -27,7 +36,7 @@ services:
       - redpanda
       - start
       - --smp=1
-      - --memory=1G
+      - --memory=512M
       - --reserve-memory=0M
       - --overprovisioned
       - --node-id=0
@@ -55,7 +64,7 @@ services:
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - ES_JAVA_OPTS=-Xms256m -Xmx256m
     ports:
       - "9200:9200"
     volumes:

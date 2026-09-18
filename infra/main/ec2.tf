@@ -38,7 +38,21 @@ resource "local_sensitive_file" "ec2_ssh_private_key" {
 # --- EC2 instance ------------------------------------------------------------
 
 resource "aws_instance" "app" {
-  ami                         = data.aws_ami.al2023.id
+  ami = data.aws_ami.al2023.id
+  # Adding Prometheus+Grafana (Phase 6, Task 2) pushed t3.small's 2GB over
+  # budget (ES's Xmx512m + Redpanda's --memory=1G + 4 Python processes +
+  # Prometheus/Grafana easily exceeds 2GB) and caused a real production
+  # incident - SSH itself became unresponsive (connection timeout during
+  # the banner exchange). t3.medium was the intended fix, but this AWS
+  # account's plan rejects any non-free-tier-eligible instance type
+  # outright (confirmed live: both ModifyInstanceAttribute and a fresh
+  # RunInstances at t3.medium were rejected) - `aws ec2
+  # describe-instance-types --filters Name=free-tier-eligible,Values=true`
+  # confirms t3.small is the largest free-tier-eligible option available
+  # to this account, so a bigger instance isn't a lever this account can
+  # pull. Reverted to restore service; the actual fix has to be reducing
+  # this instance's memory footprint instead (e.g. trimming Elasticsearch's
+  # heap, or moving a service elsewhere) - not yet done, flagged as open.
   instance_type               = "t3.small"
   subnet_id                   = aws_subnet.public_us_east_1a.id
   vpc_security_group_ids      = [aws_security_group.sg_ec2.id]

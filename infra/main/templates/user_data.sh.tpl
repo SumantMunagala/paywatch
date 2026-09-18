@@ -4,6 +4,23 @@ exec > >(tee /var/log/user-data.log) 2>&1
 
 echo "=== PayWatch EC2 bootstrap starting: $(date) ==="
 
+# --- Swap file --------------------------------------------------------------
+# t3.small (2GB RAM) is the largest instance type this AWS account's plan
+# allows (confirmed live - both resizing and launching a bigger instance
+# were rejected), and 8 containers (Redpanda, Elasticsearch, 4 app
+# processes, Prometheus, Grafana) can get close to that ceiling. Without
+# swap, exceeding it means the OOM killer (or the instance becoming fully
+# unresponsive, including SSH - a real incident this project hit) rather
+# than graceful degradation. 2GB swap matches RAM 1:1, a reasonable default
+# for a memory-constrained instance that isn't going to get bigger.
+if [ ! -f /swapfile ]; then
+  fallocate -l 2G /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  echo "/swapfile none swap sw 0 0" >> /etc/fstab
+fi
+
 # --- Docker + prerequisites ---------------------------------------------
 dnf install -y docker git unzip
 systemctl enable --now docker
