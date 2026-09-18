@@ -85,8 +85,14 @@ services:
       - .env
     networks:
       - paywatch
+    # Also needs elasticsearch healthy, unlike producer/stats: main.py calls
+    # ensure_index(es) synchronously at startup, before consuming anything -
+    # found live, crashing with a connection-refused error against ES before
+    # its ~30s healthcheck start_period had elapsed.
     depends_on:
       redpanda:
+        condition: service_healthy
+      elasticsearch:
         condition: service_healthy
 
   stats:
