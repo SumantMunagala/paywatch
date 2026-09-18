@@ -34,6 +34,21 @@ resource "aws_vpc_security_group_ingress_rule" "ec2_ssh_from_admin_ip" {
   ip_protocol       = "tcp"
 }
 
+# GitHub-hosted Actions runners have no fixed IP range (dynamic, drawn from
+# Azure's pool) - Phase 5's deploy.yml needs SSH access from wherever the
+# runner lands. Key-based auth (EC2_SSH_KEY) is the actual security
+# boundary here, not source IP - this rule only controls who can *attempt*
+# a connection. Kept as its own separate rule rather than replacing the
+# admin-IP one above, so narrowing this later doesn't touch that rule.
+resource "aws_vpc_security_group_ingress_rule" "ec2_ssh_from_internet" {
+  security_group_id = aws_security_group.sg_ec2.id
+  description       = "Allow SSH from anywhere - GitHub Actions runners have no fixed IP"
+  cidr_ipv4         = "0.0.0.0/0"
+  from_port         = 22
+  to_port           = 22
+  ip_protocol       = "tcp"
+}
+
 resource "aws_vpc_security_group_ingress_rule" "ec2_fastapi_from_internet" {
   security_group_id = aws_security_group.sg_ec2.id
   description       = "Allow FastAPI (8000) from anywhere - the public entry point for the app"
