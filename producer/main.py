@@ -1,3 +1,4 @@
+import argparse
 import random
 import sys
 import time
@@ -106,28 +107,44 @@ def delivery_report(err, msg):
         print(f"Delivery failed for {msg.key()}: {err}")
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Publish simulated transactions.")
+    parser.add_argument(
+        "--rate",
+        type=int,
+        default=1,
+        help="Events per second, per merchant (default: 1).",
+    )
+    return parser.parse_args()
+
+
 def main() -> None:
+    args = parse_args()
     merchants = load_merchants()
     kafka_config = get_kafka_config()
     ensure_topic(kafka_config)
     producer = Producer(kafka_config)
 
-    print(f"Publishing to '{TOPIC}' for {len(merchants)} merchants (Ctrl+C to stop)...")
+    print(
+        f"Publishing to '{TOPIC}' for {len(merchants)} merchants "
+        f"at {args.rate}/sec/merchant (Ctrl+C to stop)..."
+    )
 
     try:
         while True:
             for merchant in merchants:
-                event = build_event(merchant)
+                for _ in range(args.rate):
+                    event = build_event(merchant)
 
-                producer.poll(0)
-                producer.produce(
-                    TOPIC,
-                    key=event.merchant_id.encode("utf-8"),
-                    value=event.model_dump_json().encode("utf-8"),
-                    callback=delivery_report,
-                )
+                    producer.poll(0)
+                    producer.produce(
+                        TOPIC,
+                        key=event.merchant_id.encode("utf-8"),
+                        value=event.model_dump_json().encode("utf-8"),
+                        callback=delivery_report,
+                    )
 
-                print(event.model_dump_json(), flush=True)
+                    print(event.model_dump_json(), flush=True)
 
             time.sleep(1)
     except KeyboardInterrupt:
