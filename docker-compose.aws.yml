@@ -1,0 +1,111 @@
+# EC2 deployment compose file (Phase 4, Task 4). No postgres/redis here -
+# those are RDS and ElastiCache; every app container reaches them via
+# POSTGRES_URL/REDIS_URL in .env (see infra/main/templates/user_data.sh.tpl).
+#
+# App services use the *internal* Kafka listener (redpanda:9093), not 9092 -
+# unlike local dev, producer/indexer/stats/api all run as containers on this
+# same compose network now, and redpanda's external listener (9092)
+# advertises itself back as "localhost:9092", which would just be the
+# container talking to itself. See docker-compose.yml's own comment on the
+# same distinction for local dev's host-process case.
+
+networks:
+  paywatch:
+    driver: bridge
+
+volumes:
+  redpanda_data:
+  es_data:
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.18
+    container_name: redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=1G
+      - --reserve-memory=0M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9093,external://0.0.0.0:9092
+      - --advertise-kafka-addr=internal://redpanda:9093,external://localhost:9092
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+    ports:
+      - "9092:9092"
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    networks:
+      - paywatch
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.15.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    networks:
+      - paywatch
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -Eq '\"status\":\"(green|yellow)\"'"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  producer:
+    image: ${ECR_REGISTRY}/paywatch-producer:latest
+    container_name: producer
+    env_file:
+      - .env
+    networks:
+      - paywatch
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  indexer:
+    image: ${ECR_REGISTRY}/paywatch-indexer-consumer:latest
+    container_name: indexer
+    env_file:
+      - .env
+    networks:
+      - paywatch
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  stats:
+    image: ${ECR_REGISTRY}/paywatch-stats-consumer:latest
+    container_name: stats
+    env_file:
+      - .env
+    networks:
+      - paywatch
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  api:
+    image: ${ECR_REGISTRY}/paywatch-api:latest
+    container_name: api
+    env_file:
+      - .env
+    ports:
+      - "8000:8000"
+    networks:
+      - paywatch

@@ -56,7 +56,13 @@ app.add_middleware(
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    try:
+        with app.state.pg_conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        app.state.redis.ping()
+        return {"status": "ok", "postgres": "connected", "redis": "connected"}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"Health check failed: {e}")
 
 
 @app.get("/merchants")

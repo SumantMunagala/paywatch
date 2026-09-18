@@ -43,3 +43,48 @@ output "github_deploy_role_arn" {
   description = "ARN of the IAM role GitHub Actions assumes via OIDC to push images to ECR and deploy"
   value       = aws_iam_role.github_deploy_role.arn
 }
+
+output "rds_endpoint" {
+  description = "Connection endpoint (host:port) of the PayWatch RDS Postgres instance"
+  value       = aws_db_instance.main.endpoint
+}
+
+output "rds_secrets_manager_secret_name" {
+  description = "Name of the Secrets Manager secret holding RDS master credentials"
+  value       = aws_secretsmanager_secret.rds_credentials.name
+}
+
+output "redis_endpoint" {
+  description = "Primary endpoint address of the PayWatch Redis replication group"
+  value       = aws_elasticache_replication_group.redis.primary_endpoint_address
+}
+
+output "ec2_public_ip" {
+  description = "Public IP address of the PayWatch EC2 app host"
+  value       = aws_instance.app.public_ip
+}
+
+output "elastic_ip" {
+  description = "Elastic IP address associated with the PayWatch EC2 app host (stable across restarts)"
+  value       = aws_eip.app.public_ip
+}
+
+output "ecr_producer_repository_url" {
+  description = "URL of the ECR repository for the producer image"
+  value       = aws_ecr_repository.producer.repository_url
+}
+
+output "ecr_indexer_consumer_repository_url" {
+  description = "URL of the ECR repository for the indexer consumer image"
+  value       = aws_ecr_repository.indexer_consumer.repository_url
+}
+
+output "ecr_stats_consumer_repository_url" {
+  description = "URL of the ECR repository for the stats consumer image"
+  value       = aws_ecr_repository.stats_consumer.repository_url
+}
+
+output "ecr_api_repository_url" {
+  description = "URL of the ECR repository for the API image"
+  value       = aws_ecr_repository.api.repository_url
+}
