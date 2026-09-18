@@ -1,0 +1,8 @@
+[flake8]
+max-line-length = 100
+# E402: every producer/consumer/api main.py does sys.path.insert(...) before
+# its shared.config/shared.models imports on purpose (see Phase 4 Task 1's
+# Dockerfile notes - it's how each file reaches the repo root regardless of
+# CWD). That's a real architectural constraint, not an import-ordering
+# mistake, so it's ignored project-wide instead of a noqa on ~20 lines.
+extend-ignore = E402

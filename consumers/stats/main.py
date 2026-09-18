@@ -98,7 +98,8 @@ def record_alert_fired(r: redis.Redis, pg_conn, alert: AlertRecord) -> None:
         cur.execute(
             """
             INSERT INTO alerts
-                (id, merchant_id, metric, current_value, baseline_value, z_score, description, fired_at)
+                (id, merchant_id, metric, current_value, baseline_value,
+                 z_score, description, fired_at)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
