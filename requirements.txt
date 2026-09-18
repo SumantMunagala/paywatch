@@ -6,3 +6,4 @@ redis
 fastapi
 uvicorn[standard]
 boto3
+prometheus-client

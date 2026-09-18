@@ -7,6 +7,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 import psycopg2
 import redis
 from confluent_kafka import Consumer
+from prometheus_client import Counter, Gauge, start_http_server
 
 from consumers.stats.detector import AnomalyDetector, ResolveSignal
 from shared.config import POSTGRES_URL, REDIS_URL, get_kafka_config
@@ -16,6 +17,15 @@ TOPIC = "transactions"
 GROUP_ID = "stats-group"
 VOLUME_WINDOW_SECONDS = 60
 METRICS = ["success_rate", "avg_latency_ms", "avg_fraud_score", "volume_per_min"]
+METRICS_PORT = 8002
+
+transactions_processed_total = Counter(
+    "transactions_processed_total", "Total transactions processed", ["merchant_id"]
+)
+alerts_fired_total = Counter("alerts_fired_total", "Total alerts fired", ["metric"])
+consumer_lag_seconds = Gauge(
+    "consumer_lag_seconds", "Time between a message's Kafka timestamp and processing it"
+)
 
 # Smoothing factor for the EWMA below. Half-life is ln(0.5)/ln(1-alpha).
 # avg_latency_ms/avg_fraud_score are continuous values with gentle
@@ -114,6 +124,7 @@ def record_alert_fired(r: redis.Redis, pg_conn, alert: AlertRecord) -> None:
             ),
         )
 
+    alerts_fired_total.labels(metric=alert.metric).inc()
     print(f"ALERT FIRED: {alert.description}", flush=True)
 
 
@@ -150,6 +161,8 @@ def check_anomalies(
 
 
 def main() -> None:
+    start_http_server(METRICS_PORT)
+
     r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
     pg_conn = psycopg2.connect(POSTGRES_URL)
     pg_conn.autocommit = True
@@ -184,6 +197,12 @@ def main() -> None:
             event = TransactionEvent.model_validate_json(msg.value())
             stats = update_stats(r, event)
             check_anomalies(detector, r, pg_conn, event, stats)
+
+            transactions_processed_total.labels(merchant_id=event.merchant_id).inc()
+
+            timestamp_type, timestamp_ms = msg.timestamp()
+            if timestamp_type != 0:  # TIMESTAMP_NOT_AVAILABLE
+                consumer_lag_seconds.set(time.time() - timestamp_ms / 1000.0)
 
             print(
                 f"[{event.merchant_name}] "

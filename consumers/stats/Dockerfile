@@ -15,4 +15,5 @@ COPY consumers/stats/ ./consumers/stats/
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app/consumers/stats
 
+EXPOSE 8002
 CMD ["python", "main.py"]

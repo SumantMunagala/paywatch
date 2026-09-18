@@ -1,10 +1,12 @@
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from confluent_kafka import Consumer
 from elasticsearch import Elasticsearch
+from prometheus_client import Counter, Gauge, start_http_server
 
 from shared.config import ELASTICSEARCH_URL, get_kafka_config
 from shared.models import TransactionEvent
@@ -12,6 +14,15 @@ from shared.models import TransactionEvent
 TOPIC = "transactions"
 GROUP_ID = "indexer-group"
 INDEX_NAME = "transactions"
+METRICS_PORT = 8001
+
+transactions_indexed_total = Counter(
+    "transactions_indexed_total", "Total transactions indexed", ["merchant_id"]
+)
+indexer_errors_total = Counter("indexer_errors_total", "Total indexer errors")
+consumer_lag_seconds = Gauge(
+    "consumer_lag_seconds", "Time between a message's Kafka timestamp and processing it"
+)
 
 INDEX_MAPPINGS = {
     "properties": {
@@ -33,6 +44,8 @@ def ensure_index(es: Elasticsearch) -> None:
 
 
 def main() -> None:
+    start_http_server(METRICS_PORT)
+
     es = Elasticsearch(ELASTICSEARCH_URL)
     ensure_index(es)
 
@@ -64,11 +77,25 @@ def main() -> None:
 
             event = TransactionEvent.model_validate_json(msg.value())
 
-            es.index(
-                index=INDEX_NAME,
-                id=event.transaction_id,
-                document=event.model_dump(mode="json"),
-            )
+            try:
+                es.index(
+                    index=INDEX_NAME,
+                    id=event.transaction_id,
+                    document=event.model_dump(mode="json"),
+                )
+            except Exception as e:
+                # Not committed - safe to let Kafka redeliver, since
+                # re-indexing the same transaction_id is idempotent
+                # (overwrites the same ES doc, per Phase 0's design).
+                indexer_errors_total.inc()
+                print(f"Indexing error for {event.transaction_id}: {e}", flush=True)
+                continue
+
+            transactions_indexed_total.labels(merchant_id=event.merchant_id).inc()
+
+            timestamp_type, timestamp_ms = msg.timestamp()
+            if timestamp_type != 0:  # TIMESTAMP_NOT_AVAILABLE
+                consumer_lag_seconds.set(time.time() - timestamp_ms / 1000.0)
 
             consumer.commit(message=msg, asynchronous=False)
 

@@ -15,4 +15,5 @@ COPY consumers/indexer/ ./consumers/indexer/
 ENV PYTHONUNBUFFERED=1
 WORKDIR /app/consumers/indexer
 
+EXPOSE 8001
 CMD ["python", "main.py"]

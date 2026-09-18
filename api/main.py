@@ -1,4 +1,5 @@
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -9,14 +10,22 @@ import psycopg2
 import psycopg2.extras
 import redis
 from elasticsearch import Elasticsearch
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from prometheus_client import Counter, Histogram, make_asgi_app
 
 from shared.config import ELASTICSEARCH_URL, POSTGRES_URL, REDIS_URL
 from shared.models import AlertRecord
 
 TRANSACTIONS_INDEX = "transactions"
+
+http_requests_total = Counter(
+    "http_requests_total", "Total HTTP requests", ["endpoint", "status"]
+)
+http_request_duration_seconds = Histogram(
+    "http_request_duration_seconds", "HTTP request duration in seconds", ["endpoint"]
+)
 
 NUMERIC_STATS_FIELDS = {
     "transaction_count": int,
@@ -52,6 +61,25 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def track_request_metrics(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+
+    # Route path template (e.g. "/merchants/{merchant_id}/stats"), not the
+    # raw resolved URL - labeling by the real URL would create a new time
+    # series per merchant_id, unbounded cardinality for no benefit. Falls
+    # back to the raw path only for unmatched requests (404s), which have
+    # no route to read a template from.
+    route = request.scope.get("route")
+    endpoint = route.path if route else request.url.path
+
+    http_requests_total.labels(endpoint=endpoint, status=response.status_code).inc()
+    http_request_duration_seconds.labels(endpoint=endpoint).observe(duration)
+    return response
 
 
 @app.get("/health")
@@ -143,3 +171,5 @@ def get_alert_history(merchant_id: str):
 
 DASHBOARD_DIR = Path(__file__).resolve().parent.parent / "dashboard"
 app.mount("/dashboard", StaticFiles(directory=DASHBOARD_DIR, html=True), name="dashboard")
+
+app.mount("/metrics", make_asgi_app())

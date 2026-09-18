@@ -58,6 +58,15 @@ resource "aws_vpc_security_group_ingress_rule" "ec2_fastapi_from_internet" {
   ip_protocol       = "tcp"
 }
 
+resource "aws_vpc_security_group_ingress_rule" "ec2_metrics_from_vpc" {
+  security_group_id = aws_security_group.sg_ec2.id
+  description       = "Allow Prometheus metrics (8001-8002) from within the VPC only"
+  cidr_ipv4         = aws_vpc.main.cidr_block
+  from_port         = 8001
+  to_port           = 8002
+  ip_protocol       = "tcp"
+}
+
 resource "aws_vpc_security_group_egress_rule" "ec2_all_outbound" {
   security_group_id = aws_security_group.sg_ec2.id
   description       = "Allow all outbound traffic from the EC2 host"
