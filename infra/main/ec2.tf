@@ -39,26 +39,35 @@ resource "local_sensitive_file" "ec2_ssh_private_key" {
 
 resource "aws_instance" "app" {
   ami = data.aws_ami.al2023.id
-  # Adding Prometheus+Grafana (Phase 6, Task 2) pushed t3.small's 2GB over
-  # budget (ES's Xmx512m + Redpanda's --memory=1G + 4 Python processes +
-  # Prometheus/Grafana easily exceeds 2GB) and caused a real production
-  # incident - SSH itself became unresponsive (connection timeout during
-  # the banner exchange). t3.medium was the intended fix, but this AWS
-  # account's plan rejects any non-free-tier-eligible instance type
-  # outright (confirmed live: both ModifyInstanceAttribute and a fresh
-  # RunInstances at t3.medium were rejected) - `aws ec2
-  # describe-instance-types --filters Name=free-tier-eligible,Values=true`
-  # confirms t3.small is the largest free-tier-eligible option available
-  # to this account, so a bigger instance isn't a lever this account can
-  # pull. Reverted to restore service; the actual fix has to be reducing
-  # this instance's memory footprint instead (e.g. trimming Elasticsearch's
-  # heap, or moving a service elsewhere) - not yet done, flagged as open.
+  # Adding Prometheus+Grafana (Phase 6, Task 2) pushed t3.small's 2GB RAM
+  # over budget and caused a real production incident (SSH itself became
+  # unresponsive). t3.medium would have fixed it, but this AWS account's
+  # plan rejects any non-free-tier-eligible instance type outright
+  # (confirmed live: both ModifyInstanceAttribute and a fresh RunInstances
+  # at t3.medium were rejected - `aws ec2 describe-instance-types
+  # --filters Name=free-tier-eligible,Values=true` confirms t3.small is
+  # the largest option this account can launch at all). Fixed instead by
+  # lowering Redpanda/Elasticsearch's memory limits in docker-compose.aws.yml
+  # and adding a 2GB swap file below as a safety net against ever hitting
+  # this again.
   instance_type               = "t3.small"
   subnet_id                   = aws_subnet.public_us_east_1a.id
   vpc_security_group_ids      = [aws_security_group.sg_ec2.id]
   iam_instance_profile        = aws_iam_instance_profile.ec2_instance_profile.name
   key_name                    = aws_key_pair.ec2_ssh.key_name
   associate_public_ip_address = true
+
+  # AL2023's default (8GB) filled up: the 2GB swap file above, the OS
+  # itself, and 6 Docker images (Redpanda, Elasticsearch, Prometheus,
+  # Grafana, 4 app images at ~929MB combined before Grafana's pull even
+  # finished) left no room to grow - found live, "no space left on device"
+  # mid-pull. 20GB gives real headroom for image layers plus the data
+  # volumes (ES index data, Redpanda log segments, Prometheus TSDB,
+  # Grafana's sqlite db) that only grow over the instance's lifetime.
+  root_block_device {
+    volume_size = 20
+    volume_type = "gp3"
+  }
 
   user_data = templatefile("${path.module}/templates/user_data.sh.tpl", {
     aws_region     = var.aws_region
