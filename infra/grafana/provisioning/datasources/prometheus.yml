@@ -1,0 +1,18 @@
+# Auto-provisions Prometheus as a Grafana data source. Not explicitly
+# named in the task's file list, but required - Grafana doesn't
+# auto-discover a Prometheus container on its own, and without this the
+# dashboard panels would have no data source to query at all. url uses the
+# Docker service name (same reasoning as infra/prometheus.yml's scrape
+# targets), and uid is fixed so the dashboard JSON can reference it
+# reliably rather than a value only known after provisioning.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    uid: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: false

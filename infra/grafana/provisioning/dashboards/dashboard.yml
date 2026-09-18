@@ -1,0 +1,15 @@
+# Standard Grafana dashboard-provider config: any dashboard JSON dropped
+# into this same directory auto-loads.
+
+apiVersion: 1
+
+providers:
+  - name: PayWatch
+    orgId: 1
+    folder: ""
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

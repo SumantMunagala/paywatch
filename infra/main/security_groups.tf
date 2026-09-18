@@ -58,6 +58,15 @@ resource "aws_vpc_security_group_ingress_rule" "ec2_fastapi_from_internet" {
   ip_protocol       = "tcp"
 }
 
+resource "aws_vpc_security_group_ingress_rule" "ec2_grafana_from_admin_ip" {
+  security_group_id = aws_security_group.sg_ec2.id
+  description       = "Allow Grafana UI (3000) from the admin IP only"
+  cidr_ipv4         = var.your_ip_cidr
+  from_port         = 3000
+  to_port           = 3000
+  ip_protocol       = "tcp"
+}
+
 resource "aws_vpc_security_group_ingress_rule" "ec2_metrics_from_vpc" {
   security_group_id = aws_security_group.sg_ec2.id
   description       = "Allow Prometheus metrics (8001-8002) from within the VPC only"
